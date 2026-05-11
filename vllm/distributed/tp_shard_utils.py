@@ -41,7 +41,7 @@ def calculate_memory_per_shard(
 def estimate_optimal_shard_map(
     gpu_memory_gb: list[float],
     total_model_size_gb: float,
-    tensor_parallel_size: int,
+    num_gpus: int | None = None,
     min_shards_per_gpu: int = 1,
     overhead_factor: float = 1.2,
 ) -> list[int]:
@@ -54,30 +54,37 @@ def estimate_optimal_shard_map(
     Args:
         gpu_memory_gb: List of available memory for each GPU in GB.
         total_model_size_gb: Total model size in GB (weights only).
-        tensor_parallel_size: Total number of shards to distribute.
+        num_gpus: Total number of tensor parallel shards to distribute.
+                 If None, defaults to len(gpu_memory_gb).
         min_shards_per_gpu: Minimum number of shards per GPU (default 1).
         overhead_factor: Multiplier for activation and KV cache overhead.
 
     Returns:
-        List of shard counts for each GPU.
+        List of shard counts for each GPU. The length equals len(gpu_memory_gb),
+        and the sum equals num_gpus (or len(gpu_memory_gb) if num_gpus is None).
 
     Example:
         >>> gpu_memory = [16.0, 16.0, 12.0]  # 2x 3070m + 1x 3060
-        >>> estimate_optimal_shard_map(gpu_memory, 54.0, 5)
+        >>> estimate_optimal_shard_map(gpu_memory, 54.0, num_gpus=5)
         [2, 2, 1]
     """
-    if len(gpu_memory_gb) != tensor_parallel_size:
-        raise ValueError(
-            f"Length of gpu_memory_gb ({len(gpu_memory_gb)}) must equal "
-            f"tensor_parallel_size ({tensor_parallel_size})"
-        )
+    if num_gpus is None:
+        num_gpus = len(gpu_memory_gb)
+    
+    if len(gpu_memory_gb) == 0:
+        raise ValueError("gpu_memory_gb must not be empty")
 
     if sum(gpu_memory_gb) == 0:
         raise ValueError("GPU memory values must be positive")
+    
+    if num_gpus < len(gpu_memory_gb):
+        raise ValueError(
+            f"num_gpus ({num_gpus}) must be >= number of GPUs ({len(gpu_memory_gb)})"
+        )
 
     # Calculate memory per shard needed
     memory_per_shard = calculate_memory_per_shard(
-        total_model_size_gb, tensor_parallel_size, overhead_factor
+        total_model_size_gb, num_gpus, overhead_factor
     )
 
     # Initial allocation based on memory proportion
@@ -88,16 +95,16 @@ def estimate_optimal_shard_map(
         # Proportional allocation
         proportional_shards = max(
             min_shards_per_gpu,
-            int((gpu_mem / total_memory) * tensor_parallel_size + 0.5),
+            int((gpu_mem / total_memory) * num_gpus + 0.5),
         )
         shard_map.append(proportional_shards)
 
-    # Adjust to ensure sum equals tensor_parallel_size
+    # Adjust to ensure sum equals num_gpus
     current_sum = sum(shard_map)
     
-    if current_sum < tensor_parallel_size:
+    if current_sum < num_gpus:
         # Add remaining shards to GPUs with most memory
-        remaining = tensor_parallel_size - current_sum
+        remaining = num_gpus - current_sum
         gpu_indices_sorted = sorted(
             range(len(gpu_memory_gb)),
             key=lambda i: gpu_memory_gb[i],
@@ -105,9 +112,9 @@ def estimate_optimal_shard_map(
         )
         for i in range(remaining):
             shard_map[gpu_indices_sorted[i % len(gpu_indices_sorted)]] += 1
-    elif current_sum > tensor_parallel_size:
+    elif current_sum > num_gpus:
         # Remove excess shards from GPUs with least memory
-        excess = current_sum - tensor_parallel_size
+        excess = current_sum - num_gpus
         gpu_indices_sorted = sorted(
             range(len(gpu_memory_gb)),
             key=lambda i: gpu_memory_gb[i],
@@ -118,14 +125,14 @@ def estimate_optimal_shard_map(
                 shard_map[idx] -= 1
 
     # Final validation
-    if sum(shard_map) != tensor_parallel_size:
+    if sum(shard_map) != num_gpus:
         logger.warning(
-            "Shard map sum (%d) does not match tensor_parallel_size (%d). "
+            "Shard map sum (%d) does not match num_gpus (%d). "
             "Adjusting largest GPU.",
             sum(shard_map),
-            tensor_parallel_size,
+            num_gpus,
         )
-        diff = tensor_parallel_size - sum(shard_map)
+        diff = num_gpus - sum(shard_map)
         max_gpu_idx = gpu_memory_gb.index(max(gpu_memory_gb))
         shard_map[max_gpu_idx] += diff
 
