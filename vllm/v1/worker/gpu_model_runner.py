@@ -170,6 +170,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
+from vllm.v1.spec_decode.mtp import MTPProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
@@ -557,6 +558,11 @@ class GPUModelRunner(
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "mtp":
+                # MTP only works on the last PP rank where lm_head resides
+                self.drafter = MTPProposer(
+                    vllm_config=self.vllm_config, device=self.device, runner=self
+                )
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
