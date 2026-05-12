@@ -4195,14 +4195,33 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        spec_config = self.speculative_config
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
+                # For MTP/EAGLE/DraftModel methods, sampled_token_ids has shape
+                # [num_reqs, num_spec_tokens + 1], but PP broadcast expects [num_reqs, 1].
+                # We only need to broadcast the first token (current step) for PP sync.
+                sampled_token_ids_to_broadcast = sampler_output.sampled_token_ids
+                if (
+                    spec_config is not None
+                    and (
+                        spec_config.use_eagle()
+                        or spec_config.uses_draft_model()
+                        or spec_config.uses_extract_hidden_states()
+                    )
+                    and sampled_token_ids_to_broadcast.dim() == 2
+                    and sampled_token_ids_to_broadcast.shape[-1] > 1
+                ):
+                    # Extract only the first column (current token) for PP broadcast
+                    sampled_token_ids_to_broadcast = sampled_token_ids_to_broadcast[
+                        :, :1
+                    ]
                 self._pp_broadcast_prev_sampled_token_ids(
-                    sampler_output.sampled_token_ids
+                    sampled_token_ids_to_broadcast
                 )
 
         self._draft_token_ids = None
