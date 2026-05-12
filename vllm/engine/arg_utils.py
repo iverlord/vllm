@@ -449,7 +449,6 @@ class EngineArgs:
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
-    tensor_parallel_shard_map: list[int] | None = ParallelConfig.tensor_parallel_shard_map
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -924,13 +923,6 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
-        )
-        parallel_group.add_argument(
-            "--tensor-parallel-shard-map",
-            type=lambda x: [int(i) for i in x.strip("[]").split(",")],
-            default=None,
-            help="List of shard counts per GPU for uneven tensor parallelism. "
-            "Example: [2,2,1] for 3 GPUs with different memory capacities.",
         )
         parallel_group.add_argument(
             "--decode-context-parallel-size",
@@ -1910,7 +1902,6 @@ class EngineArgs:
             numa_bind=self.numa_bind,
             numa_bind_nodes=self.numa_bind_nodes,
             numa_bind_cpus=self.numa_bind_cpus,
-            tensor_parallel_shard_map=self.tensor_parallel_shard_map,
         )
 
         speculative_config = self.create_speculative_config(

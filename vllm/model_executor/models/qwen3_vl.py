@@ -538,9 +538,12 @@ class Qwen3_VisionTransformer(nn.Module):
         )
         self.num_grid_per_side = int(self.num_position_embeddings**0.5)
 
-        # Vision encoder should not use tensor parallelism as it has fixed architecture
-        # that may not be divisible by TP size. Always use TP=1 for vision components.
-        self.tp_size = 1
+        use_data_parallel = is_vit_use_data_parallel()
+        self.tp_size = (
+            1
+            if use_data_parallel
+            else parallel_state.get_tensor_model_parallel_world_size()
+        )
 
         # NOTE: This is used for creating empty tensor for all_gather for
         # DP ViT. Here out_hidden_size is enlarged due to deepstack

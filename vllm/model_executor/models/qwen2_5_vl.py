@@ -317,10 +317,13 @@ class Qwen2_5_VisionAttention(nn.Module):
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
-        # Vision encoder should not use tensor parallelism as it has fixed architecture
-        # that may not be divisible by TP size. Always use TP=1 for vision components.
-        self.tp_size = 1
-        self.tp_rank = 0
+        use_data_parallel = is_vit_use_data_parallel()
+        self.tp_size = (
+            1
+            if use_data_parallel
+            else parallel_state.get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
