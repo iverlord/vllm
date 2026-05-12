@@ -4647,38 +4647,6 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
                 slot_mappings=slot_mappings,
             )
-        elif spec_config.uses_extract_hidden_states():
-            if not hasattr(self, "drafter"):
-                return [[] for _ in sampled_token_ids] if isinstance(sampled_token_ids, list) else torch.empty((sampled_token_ids.shape[0], 0), dtype=sampled_token_ids.dtype, device=sampled_token_ids.device)
-            assert isinstance(self.drafter, ExtractHiddenStatesProposer)
-            assert isinstance(sampled_token_ids, torch.Tensor), (
-                "sampled_token_ids should be a torch.Tensor for "
-                "extract_hidden_states method."
-            )
-            if not self.use_aux_hidden_state_outputs or aux_hidden_states is None:
-                raise ValueError(
-                    "aux_hidden_states are required when using `extract_hidden_states`"
-                )
-            target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
-
-            draft_token_ids = self.drafter.propose(
-                sampled_token_ids=sampled_token_ids,
-                target_hidden_states=target_hidden_states,
-                common_attn_metadata=common_attn_metadata,
-                slot_mappings=slot_mappings,
-            )
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
-                )
-            )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
-
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
@@ -4806,6 +4774,37 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+            )
+        elif spec_config.uses_extract_hidden_states():
+            if not hasattr(self, "drafter"):
+                return [[] for _ in sampled_token_ids] if isinstance(sampled_token_ids, list) else torch.empty((sampled_token_ids.shape[0], 0), dtype=sampled_token_ids.dtype, device=sampled_token_ids.device)
+            assert isinstance(self.drafter, ExtractHiddenStatesProposer)
+            assert isinstance(sampled_token_ids, torch.Tensor), (
+                "sampled_token_ids should be a torch.Tensor for "
+                "extract_hidden_states method."
+            )
+            if not self.use_aux_hidden_state_outputs or aux_hidden_states is None:
+                raise ValueError(
+                    "aux_hidden_states are required when using `extract_hidden_states`"
+                )
+            target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
+
+            draft_token_ids = self.drafter.propose(
+                sampled_token_ids=sampled_token_ids,
+                target_hidden_states=target_hidden_states,
+                common_attn_metadata=common_attn_metadata,
+                slot_mappings=slot_mappings,
+            )
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask.gpu,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
             )
 
         return draft_token_ids
