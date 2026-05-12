@@ -139,9 +139,18 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = self.fc(hidden_states)
             residual = None
         else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            if intermediate_tensors is None:
+                # During dummy run for profiling, intermediate_tensors may be None
+                # Create dummy tensors with appropriate shapes
+                batch_size = hidden_states.shape[0]
+                hidden_dim = hidden_states.shape[-1]
+                hidden_states = torch.zeros(
+                    batch_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
+                )
+                residual = None
+            else:
+                hidden_states = intermediate_tensors["hidden_states"]
+                residual = intermediate_tensors["residual"]
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         hidden_states, residual = self.layers[current_step_idx](

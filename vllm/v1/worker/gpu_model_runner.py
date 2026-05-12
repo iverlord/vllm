@@ -170,6 +170,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
+from vllm.v1.spec_decode.mtp import MTPProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
@@ -524,6 +525,7 @@ class GPUModelRunner(
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
+                | MTPProposer
             )
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -557,6 +559,11 @@ class GPUModelRunner(
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "mtp":
+                # MTP only works on the last PP rank where lm_head resides
+                self.drafter = MTPProposer(
+                    vllm_config=self.vllm_config, device=self.device, runner=self
+                )
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -2299,7 +2306,9 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
+                if hasattr(self, "drafter") and isinstance(
+                    self.drafter, (EagleProposer, DFlashProposer, MTPProposer)
+                ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -4186,14 +4195,33 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        spec_config = self.speculative_config
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
+                # For MTP/EAGLE/DraftModel methods, sampled_token_ids has shape
+                # [num_reqs, num_spec_tokens + 1], but PP broadcast expects [num_reqs, 1].
+                # We only need to broadcast the first token (current step) for PP sync.
+                sampled_token_ids_to_broadcast = sampler_output.sampled_token_ids
+                if (
+                    spec_config is not None
+                    and (
+                        spec_config.use_eagle()
+                        or spec_config.uses_draft_model()
+                        or spec_config.uses_extract_hidden_states()
+                    )
+                    and sampled_token_ids_to_broadcast.dim() == 2
+                    and sampled_token_ids_to_broadcast.shape[-1] > 1
+                ):
+                    # Extract only the first column (current token) for PP broadcast
+                    sampled_token_ids_to_broadcast = sampled_token_ids_to_broadcast[
+                        :, :1
+                    ]
                 self._pp_broadcast_prev_sampled_token_ids(
-                    sampler_output.sampled_token_ids
+                    sampled_token_ids_to_broadcast
                 )
 
         self._draft_token_ids = None
@@ -4230,15 +4258,16 @@ class GPUModelRunner(
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
-            if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
+            if use_gpu_toks and hasattr(self, "drafter"):
+                # EAGLE/DraftModel/MTP speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
-                    | ExtractHiddenStatesProposer,
+                    | ExtractHiddenStatesProposer
+                    | MTPProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4259,9 +4288,8 @@ class GPUModelRunner(
             elif (
                 spec_config.use_ngram_gpu()
                 and not spec_config.disable_padded_drafter_batch
+                and hasattr(self, "drafter")
             ):
-                assert isinstance(self.drafter, NgramProposerGPU)
-                sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
@@ -4518,10 +4546,25 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        
+        # MTP/EAGLE/DraftModel only run on last PP rank
+        if not get_pp_group().is_last_rank:
+            # Return empty draft tokens for non-last ranks
+            if isinstance(sampled_token_ids, list):
+                return [[] for _ in sampled_token_ids]
+            else:
+                return torch.empty(
+                    (sampled_token_ids.shape[0], 0),
+                    dtype=sampled_token_ids.dtype,
+                    device=sampled_token_ids.device,
+                )
+        
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
             assert isinstance(sampled_token_ids, list)
+            if not hasattr(self, "drafter"):
+                return [[] for _ in sampled_token_ids]
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
                 sampled_token_ids,
@@ -4530,6 +4573,8 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
         elif spec_config.use_ngram_gpu():
+            if not hasattr(self, "drafter"):
+                return torch.empty((sampled_token_ids.shape[0], 0), dtype=sampled_token_ids.dtype, device=sampled_token_ids.device)
             assert isinstance(self.drafter, NgramProposerGPU)
             (
                 next_token_ids,
@@ -4568,12 +4613,16 @@ class GPUModelRunner(
             )
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
+            if not hasattr(self, "drafter"):
+                return [[] for _ in sampled_token_ids] if isinstance(sampled_token_ids, list) else torch.empty((sampled_token_ids.shape[0], 0), dtype=sampled_token_ids.dtype, device=sampled_token_ids.device)
             assert isinstance(self.drafter, SuffixDecodingProposer)
             draft_token_ids = self.drafter.propose(
                 self.input_batch, sampled_token_ids, slot_mappings=slot_mappings
             )
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
+            if not hasattr(self, "drafter"):
+                return [[] for _ in sampled_token_ids] if isinstance(sampled_token_ids, list) else torch.empty((sampled_token_ids.shape[0], 0), dtype=sampled_token_ids.dtype, device=sampled_token_ids.device)
             assert isinstance(self.drafter, MedusaProposer)
 
             if sample_hidden_states.shape[0] == len(sampled_token_ids):
@@ -4598,43 +4647,15 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
                 slot_mappings=slot_mappings,
             )
-        elif spec_config.uses_extract_hidden_states():
-            assert isinstance(self.drafter, ExtractHiddenStatesProposer)
-            assert isinstance(sampled_token_ids, torch.Tensor), (
-                "sampled_token_ids should be a torch.Tensor for "
-                "extract_hidden_states method."
-            )
-            if not self.use_aux_hidden_state_outputs or aux_hidden_states is None:
-                raise ValueError(
-                    "aux_hidden_states are required when using `extract_hidden_states`"
-                )
-            target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
-
-            draft_token_ids = self.drafter.propose(
-                sampled_token_ids=sampled_token_ids,
-                target_hidden_states=target_hidden_states,
-                common_attn_metadata=common_attn_metadata,
-                slot_mappings=slot_mappings,
-            )
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
-                )
-            )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
-
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
         ):
+            if not hasattr(self, "drafter"):
+                return [[] for _ in sampled_token_ids] if isinstance(sampled_token_ids, list) else torch.empty((sampled_token_ids.shape[0], 0), dtype=sampled_token_ids.dtype, device=sampled_token_ids.device)
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer | MTPProposer
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -4753,6 +4774,37 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+            )
+        elif spec_config.uses_extract_hidden_states():
+            if not hasattr(self, "drafter"):
+                return [[] for _ in sampled_token_ids] if isinstance(sampled_token_ids, list) else torch.empty((sampled_token_ids.shape[0], 0), dtype=sampled_token_ids.dtype, device=sampled_token_ids.device)
+            assert isinstance(self.drafter, ExtractHiddenStatesProposer)
+            assert isinstance(sampled_token_ids, torch.Tensor), (
+                "sampled_token_ids should be a torch.Tensor for "
+                "extract_hidden_states method."
+            )
+            if not self.use_aux_hidden_state_outputs or aux_hidden_states is None:
+                raise ValueError(
+                    "aux_hidden_states are required when using `extract_hidden_states`"
+                )
+            target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
+
+            draft_token_ids = self.drafter.propose(
+                sampled_token_ids=sampled_token_ids,
+                target_hidden_states=target_hidden_states,
+                common_attn_metadata=common_attn_metadata,
+                slot_mappings=slot_mappings,
+            )
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask.gpu,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
             )
 
         return draft_token_ids
@@ -5547,7 +5599,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and get_pp_group().is_last_rank and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -5557,7 +5609,8 @@ class GPUModelRunner(
                     EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
-                    | ExtractHiddenStatesProposer,
+                    | ExtractHiddenStatesProposer
+                    | MTPProposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -6333,12 +6386,12 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer | MTPProposer
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6385,13 +6438,17 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | ExtractHiddenStatesProposer,
+                EagleProposer | DFlashProposer | ExtractHiddenStatesProposer | MTPProposer,
             )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
@@ -6845,9 +6902,16 @@ class GPUModelRunner(
 
         if (
             self.speculative_config
-            and self.speculative_config.uses_extract_hidden_states()
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
-            assert isinstance(self.drafter, ExtractHiddenStatesProposer)
+            assert isinstance(
+                self.drafter,
+                EagleProposer | DFlashProposer | ExtractHiddenStatesProposer | MTPProposer,
+            )
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)

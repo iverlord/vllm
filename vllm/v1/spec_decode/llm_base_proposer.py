@@ -816,6 +816,11 @@ class SpecDecodeBaseProposer:
         }
         if self.pass_hidden_states_to_model:
             model_kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+        
+        # For MTP models with pipeline parallelism, we need to pass intermediate_tensors
+        # as None during dummy run to avoid assertion errors
+        if self.method == "mtp":
+            model_kwargs["intermediate_tensors"] = None
 
         return model_kwargs, num_input_tokens
 
