@@ -363,18 +363,6 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
-    tensor_parallel_shard_map: list[int] | None = None
-    """
-    Manual mapping of tensor parallel shards to GPUs for non-uniform distribution.
-    This allows using tensor parallelism with an odd number of GPUs or GPUs with
-    different memory capacities.
-    
-    Example: For 3 GPUs (2x 16GB + 1x 12GB), use [2, 2, 1] to assign more shards
-    to GPUs with more memory. The sum of values must equal tensor_parallel_size.
-    
-    If None, uniform distribution is used (default behavior).
-    """
-
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
@@ -491,23 +479,6 @@ class ParallelConfig:
             raise ValueError(
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
-
-        # Validate tensor_parallel_shard_map if provided
-        if self.tensor_parallel_shard_map is not None:
-            if len(self.tensor_parallel_shard_map) != self.tensor_parallel_size:
-                raise ValueError(
-                    f"tensor_parallel_shard_map length ({len(self.tensor_parallel_shard_map)}) "
-                    f"must equal tensor_parallel_size ({self.tensor_parallel_size})"
-                )
-            if sum(self.tensor_parallel_shard_map) != self.tensor_parallel_size:
-                raise ValueError(
-                    f"Sum of tensor_parallel_shard_map values ({sum(self.tensor_parallel_shard_map)}) "
-                    f"must equal tensor_parallel_size ({self.tensor_parallel_size})"
-                )
-            if any(x <= 0 for x in self.tensor_parallel_shard_map):
-                raise ValueError(
-                    "All values in tensor_parallel_shard_map must be positive integers"
-                )
 
         return self
 
