@@ -10,8 +10,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 import vllm.envs as envs
 from vllm.distributed import (
     divide,
-    get_global_shard_offset,
-    get_gpu_shard_count,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     split_tensor_along_last_dim,
@@ -449,20 +447,9 @@ class ColumnParallelLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        # Handle custom shard distribution for heterogeneous GPUs
-        if not disable_tp:
-            self.gpu_shard_count = get_gpu_shard_count()
-            self.global_shard_offset = get_global_shard_offset()
-            self.tp_size = get_tensor_model_parallel_world_size()
-            # For custom shard maps, tp_rank is the global offset
-            self.tp_rank = self.global_shard_offset
-        else:
-            self.gpu_shard_count = 1
-            self.global_shard_offset = 0
-            self.tp_rank = 0
-            self.tp_size = 1
-        
-        # Calculate partition sizes based on total TP world size
+        # Divide the weight matrix along the last dimension.
+        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -570,34 +557,15 @@ class ColumnParallelLinear(LinearBase):
         param_data = param.data
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
-            
-            # For custom shard maps, each GPU may hold multiple contiguous shards
-            # Load all shards assigned to this GPU
-            if hasattr(self, 'global_shard_offset') and hasattr(self, 'gpu_shard_count'):
-                # Calculate which shard within this GPU's allocation we're loading
-                # For column parallel, we load the contiguous range assigned to this GPU
-                start_idx = self.global_shard_offset * shard_size
-                total_shards_for_gpu = self.gpu_shard_count
-                loaded_weight = loaded_weight.narrow(
-                    output_dim, 
-                    start_idx, 
-                    shard_size * total_shards_for_gpu
-                )
-            else:
-                start_idx = self.tp_rank * shard_size
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape, (
-            f"Shape mismatch: param {param_data.shape} vs loaded {loaded_weight.shape}. "
-            f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
-            f"gpu_shard_count={getattr(self, 'gpu_shard_count', 'N/A')}, "
-            f"global_shard_offset={getattr(self, 'global_shard_offset', 'N/A')}"
-        )
+        assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
@@ -1468,20 +1436,9 @@ class RowParallelLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        # Handle custom shard distribution for heterogeneous GPUs
-        if not disable_tp:
-            self.gpu_shard_count = get_gpu_shard_count()
-            self.global_shard_offset = get_global_shard_offset()
-            self.tp_size = get_tensor_model_parallel_world_size()
-            # For custom shard maps, tp_rank is the global offset
-            self.tp_rank = self.global_shard_offset
-        else:
-            self.gpu_shard_count = 1
-            self.global_shard_offset = 0
-            self.tp_rank = 0
-            self.tp_size = 1
-        
-        # Calculate partition sizes based on total TP world size
+        # Divide the weight matrix along the first dimension.
+        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1558,34 +1515,15 @@ class RowParallelLinear(LinearBase):
         param_data = param.data
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
-            
-            # For custom shard maps, each GPU may hold multiple contiguous shards
-            # Load all shards assigned to this GPU
-            if hasattr(self, 'global_shard_offset') and hasattr(self, 'gpu_shard_count'):
-                # Calculate which shard within this GPU's allocation we're loading
-                # For row parallel, we load the contiguous range assigned to this GPU
-                start_idx = self.global_shard_offset * shard_size
-                total_shards_for_gpu = self.gpu_shard_count
-                loaded_weight = loaded_weight.narrow(
-                    input_dim, 
-                    start_idx, 
-                    shard_size * total_shards_for_gpu
-                )
-            else:
-                start_idx = self.tp_rank * shard_size
-                loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape, (
-            f"Shape mismatch: param {param_data.shape} vs loaded {loaded_weight.shape}. "
-            f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
-            f"gpu_shard_count={getattr(self, 'gpu_shard_count', 'N/A')}, "
-            f"global_shard_offset={getattr(self, 'global_shard_offset', 'N/A')}"
-        )
+        assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):

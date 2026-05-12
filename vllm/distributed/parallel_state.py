@@ -1512,9 +1512,6 @@ def initialize_model_parallel(
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
-    
-    For heterogeneous GPU configurations (different memory sizes), you can use
-    tensor_parallel_shard_map in ParallelConfig to specify custom shard distribution.
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -1526,10 +1523,6 @@ def initialize_model_parallel(
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
     coord_store: Store | None = None
-    
-    # Get custom shard map if provided
-    tensor_parallel_shard_map = getattr(parallel_config, 'tensor_parallel_shard_map', None)
-    
     if enable_elastic_ep:
         coord_store = get_cached_tcp_store_client(
             parallel_config.data_parallel_master_ip,
@@ -1576,51 +1569,11 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
-    
-    # Handle custom shard map for heterogeneous GPU configurations
-    if tensor_parallel_shard_map is not None:
-        # Custom shard distribution: build TP groups based on shard map
-        logger.info(
-            "Using custom tensor parallel shard map: %s",
-            tensor_parallel_shard_map,
-        )
-        
-        # Calculate cumulative offsets for each GPU
-        from vllm.distributed.tp_shard_utils import get_cumulative_shard_offsets
-        offsets = get_cumulative_shard_offsets(tensor_parallel_shard_map)
-        
-        # Build custom TP groups based on shard map
-        # Each group contains ranks that share the same logical shard position
-        custom_group_ranks = []
-        num_dp_pp_pcp_groups = world_size // (data_parallel_size * pipeline_model_parallel_size * 
-                                               prefill_context_model_parallel_size * tensor_model_parallel_size)
-        
-        # For each DP/PP/PCP combination, create TP groups according to shard map
-        for base_idx in range(num_dp_pp_pcp_groups * data_parallel_size * 
-                              pipeline_model_parallel_size * prefill_context_model_parallel_size):
-            # Calculate the base rank for this group
-            base_rank = base_idx * tensor_parallel_size
-            
-            # Create groups based on shard distribution
-            # Each GPU gets a contiguous range of shard ranks
-            current_offset = 0
-            for gpu_idx, num_shards in enumerate(tensor_parallel_shard_map):
-                if num_shards > 0:
-                    group = list(range(base_rank + current_offset, 
-                                      base_rank + current_offset + num_shards))
-                    custom_group_ranks.append(group)
-                current_offset += num_shards
-        
-        group_ranks = custom_group_ranks
-    else:
-        # Standard uniform distribution
-        group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-        group_ranks = [x.tolist() for x in group_ranks]
-    
+    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+    group_ranks = [x.tolist() for x in group_ranks]
     if enable_elastic_ep:
         group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
-    
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1881,83 +1834,6 @@ def get_tensor_model_parallel_world_size() -> int:
 def get_tensor_model_parallel_rank() -> int:
     """Return my rank for the tensor model parallel group."""
     return get_tp_group().rank_in_group
-
-
-def get_tensor_model_parallel_shard_map() -> list[int] | None:
-    """
-    Return the custom tensor parallel shard map if configured.
-    
-    Returns None if using uniform distribution.
-    """
-    from vllm.config import get_current_vllm_config
-    
-    try:
-        config = get_current_vllm_config()
-        return getattr(config.parallel_config, 'tensor_parallel_shard_map', None)
-    except Exception:
-        # Config not available (e.g., during early initialization)
-        return None
-
-
-def get_gpu_shard_count(gpu_idx: int | None = None) -> int:
-    """
-    Return the number of shards assigned to a specific GPU.
-    
-    If gpu_idx is None, returns the shard count for the current GPU.
-    Uses the custom shard map if configured, otherwise returns 1 
-    (uniform distribution).
-    
-    Args:
-        gpu_idx: GPU index (local rank). If None, uses current local rank.
-    
-    Returns:
-        Number of shards assigned to the specified GPU.
-    """
-    shard_map = get_tensor_model_parallel_shard_map()
-    
-    if shard_map is None:
-        # Uniform distribution: each GPU has 1 shard
-        return 1
-    
-    if gpu_idx is None:
-        from vllm.distributed import get_world_group
-        gpu_idx = get_world_group().local_rank
-    
-    if gpu_idx < 0 or gpu_idx >= len(shard_map):
-        raise ValueError(
-            f"Invalid GPU index {gpu_idx}. Shard map has {len(shard_map)} entries."
-        )
-    
-    return shard_map[gpu_idx]
-
-
-def get_global_shard_offset() -> int:
-    """
-    Return the global shard offset for the current GPU.
-    
-    This is the starting index of shards assigned to the current GPU
-    in the global shard numbering scheme.
-    
-    Returns:
-        Global shard offset for the current GPU.
-    
-    Example:
-        With shard_map=[2, 2, 1]:
-        - GPU 0: offset=0, shards=[0, 1]
-        - GPU 1: offset=2, shards=[2, 3]
-        - GPU 2: offset=4, shards=[4]
-    """
-    shard_map = get_tensor_model_parallel_shard_map()
-    
-    if shard_map is None:
-        # Uniform distribution: offset equals rank
-        return get_tensor_model_parallel_rank()
-    
-    from vllm.distributed import get_world_group
-    gpu_idx = get_world_group().local_rank
-    
-    # Sum up shards from all previous GPUs
-    return sum(shard_map[:gpu_idx])
 
 
 def get_decode_context_model_parallel_world_size() -> int:
